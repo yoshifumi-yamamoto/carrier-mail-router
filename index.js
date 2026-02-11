@@ -26,6 +26,11 @@ const NOTIFIED_MAX_KEYS = 4000;
 // 1回の実行で拾う上限（まとめるけど、拾いすぎ防止）
 const MAX_COLLECT_PER_RUN = 30;
 
+// スプレッドシート設定
+const SETTINGS_SPREADSHEET_ID = ''; // TODO: 設定シートがあるスプレッドシートID
+const SETTINGS_SHEET_NAME = '設定';
+const ROLE_INVOICE_CONFIRMED = '請求確定';
+
 
 // ====== メイン ======
 function notifyCarrierEmailsToChatwork() {
@@ -108,6 +113,9 @@ function notifyCarrierEmailsToChatwork() {
 
     // ★送信（429ならバックオフ）
     postToChatworkWithRetry_(CHATWORK_ROOM_ID, body);
+
+    // ★請求確定はタスク化
+    createTasksForInvoiceConfirmed_(items);
 
     // ★送信成功後に通知済み確定
     const now = Date.now();
@@ -198,6 +206,58 @@ function postToChatworkRaw_(roomId, message) {
     payload: { body: message },
     muteHttpExceptions: true,
   });
+}
+
+// ====== Chatworkタスク作成 ======
+function createTasksForInvoiceConfirmed_(items) {
+  const targetItems = items.filter(it => it.bucket === 'invoice_confirmed');
+  if (!targetItems.length) return;
+
+  const assignee = getAssigneeIdByRole_(ROLE_INVOICE_CONFIRMED);
+  if (!assignee) return;
+
+  const limitTs = Math.floor((Date.now() + 3 * 24 * 60 * 60 * 1000) / 1000);
+
+  for (const it of targetItems) {
+    const taskBody = [
+      `【請求確定】${it.carrier}`,
+      `Subject: ${it.subject}`,
+      `From: ${it.from}`,
+      `Gmail: ${it.link}`,
+    ].join('\n');
+    createChatworkTask_(CHATWORK_ROOM_ID, taskBody, assignee, limitTs);
+  }
+}
+
+function createChatworkTask_(roomId, body, toIds, limitTs) {
+  const url = `https://api.chatwork.com/v2/rooms/${roomId}/tasks`;
+  return UrlFetchApp.fetch(url, {
+    method: 'post',
+    headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN },
+    payload: {
+      body,
+      to_ids: String(toIds),
+      limit: String(limitTs),
+    },
+    muteHttpExceptions: true,
+  });
+}
+
+// ====== 設定シート ======
+function getAssigneeIdByRole_(role) {
+  if (!SETTINGS_SPREADSHEET_ID) return '';
+  const ss = SpreadsheetApp.openById(SETTINGS_SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  if (!sheet) return '';
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return '';
+
+  const values = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+  for (const [r, id] of values) {
+    if (String(r).trim() === role) return String(id).trim();
+  }
+  return '';
 }
 
 
