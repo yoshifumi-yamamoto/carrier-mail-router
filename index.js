@@ -27,9 +27,14 @@ const NOTIFIED_MAX_KEYS = 4000;
 const MAX_COLLECT_PER_RUN = 30;
 
 // スプレッドシート設定
-const SETTINGS_SPREADSHEET_ID = ''; // TODO: 設定シートがあるスプレッドシートID
+// このスクリプトがスプレッドシートに紐づいている前提
 const SETTINGS_SHEET_NAME = '設定';
 const ROLE_INVOICE_CONFIRMED = '請求確定';
+
+// Supabase（ScriptProperties に設定）
+const SUPABASE_URL_PROP = 'SUPABASE_URL';
+const SUPABASE_SERVICE_ROLE_KEY_PROP = 'SUPABASE_SERVICE_ROLE_KEY';
+const SUPABASE_ORDERS_TABLE = 'orders';
 
 
 // ====== メイン ======
@@ -73,6 +78,7 @@ function notifyCarrierEmailsToChatwork() {
         const link = `https://mail.google.com/mail/u/0/#all/${msgId}`;
 
         const cls = classifyCarrierEmail_(from, subject);
+        const trackingNumbers = extractTrackingNumbers_(subject, bodyText);
 
         items.push({
           msgId,
@@ -84,6 +90,7 @@ function notifyCarrierEmailsToChatwork() {
           date,
           snippet,
           link,
+          trackingNumbers,
         });
 
         // ここではまだ notified を確定しない（投稿成功後に確定）
@@ -95,15 +102,24 @@ function notifyCarrierEmailsToChatwork() {
 
     if (!items.length) return;
 
+    // 追跡番号から対象アカウントを引く
+    const trackingToUsers = fetchEbayUserIdsByTrackingNumbers_(items);
+
     // 1通にまとめる（429対策）
     const header = `[info][title]📦 キャリアメール新着 ${items.length}件（DHL/FedEx）[/title]`;
     const blocks = items.map((it, idx) => {
+      const tns = it.trackingNumbers || [];
+      const users = tns.flatMap(tn => trackingToUsers[tn] || []);
+      const uniqueUsers = Array.from(new Set(users)).filter(Boolean);
+
       return [
         `#${idx + 1} ${it.title}｜${it.carrier}`,
         `■ Subject: ${escapeForChatwork_(it.subject)}`,
         `■ From: ${escapeForChatwork_(it.from)}`,
         `■ Date: ${it.date}`,
         `■ Category: ${it.bucket}`,
+        tns.length ? `■ Tracking: ${tns.join(', ')}` : '',
+        uniqueUsers.length ? `■ 対象アカウント: ${uniqueUsers.join(', ')}` : '',
         it.snippet ? `■ Snippet: ${escapeForChatwork_(it.snippet)}` : '',
         `■ Gmail: ${it.link}`,
       ].filter(Boolean).join('\n');
@@ -166,6 +182,9 @@ function classifyCarrierEmail_(from, subject) {
     if (includesAnyLower(s, ['your latest dhl invoice:'])) {
       return { carrier: 'DHL', title: '【請求確定】CSV取込', bucket: 'invoice_confirmed' };
     }
+    if (includesAnyJP(sj, ['請求書発行のお知らせ'])) {
+      return { carrier: 'DHL', title: '【請求確定】CSV取込', bucket: 'invoice_confirmed' };
+    }
     if (includesAnyLower(s, ['awb']) || includesAnyJP(sj, ['運送状番号', '送り状番号'])) {
       return { carrier: 'DHL', title: '【要調査】運送状/AWB', bucket: 'awb_inquiry' };
     }
@@ -173,6 +192,97 @@ function classifyCarrierEmail_(from, subject) {
   }
 
   return { carrier: 'Other', title: '【その他】確認のみ', bucket: 'other' };
+}
+
+// ====== 追跡番号抽出 ======
+function extractTrackingNumbers_(subject, bodyText) {
+  const text = [subject || '', bodyText || ''].join(' ');
+  const results = [];
+
+  // FedEx: 12〜15桁（代表: 12/15桁）
+  const fedex = text.match(/\b\d{12,15}\b/g);
+  if (fedex) results.push(...fedex);
+
+  // DHL: 10桁
+  const dhl = text.match(/\b\d{10}\b/g);
+  if (dhl) results.push(...dhl);
+
+  // 重複排除
+  return Array.from(new Set(results));
+}
+
+// ====== Supabase 連携 ======
+function fetchEbayUserIdsByTrackingNumbers_(items) {
+  const cfg = getSupabaseConfig_();
+  if (!cfg) return {};
+
+  const all = [];
+  for (const it of items) {
+    if (it.trackingNumbers && it.trackingNumbers.length) {
+      all.push(...it.trackingNumbers);
+    }
+  }
+  const uniqueTracking = Array.from(new Set(all));
+  if (!uniqueTracking.length) return {};
+
+  const map = {};
+  const batchSize = 100;
+  for (let i = 0; i < uniqueTracking.length; i += batchSize) {
+    const batch = uniqueTracking.slice(i, i + batchSize);
+    const rows = querySupabaseOrdersByTracking_(cfg, batch);
+    for (const row of rows) {
+      const tn = String(row.shipping_tracking_number || '').trim();
+      const user = String(row.ebay_user_id || '').trim();
+      if (!tn || !user) continue;
+      if (!map[tn]) map[tn] = [];
+      map[tn].push(user);
+    }
+  }
+  return map;
+}
+
+function getSupabaseConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const url = (props.getProperty(SUPABASE_URL_PROP) || '').trim();
+  const key = (props.getProperty(SUPABASE_SERVICE_ROLE_KEY_PROP) || '').trim();
+  if (!url || !key) return null;
+  return { url, key };
+}
+
+function querySupabaseOrdersByTracking_(cfg, trackingNumbers) {
+  const encodedList = trackingNumbers
+    .map(t => String(t).trim())
+    .filter(Boolean)
+    .map(t => `"${t.replace(/"/g, '\\"')}"`)
+    .join(',');
+  if (!encodedList) return [];
+
+  const endpoint = `${cfg.url}/rest/v1/${SUPABASE_ORDERS_TABLE}`
+    + `?select=shipping_tracking_number,ebay_user_id`
+    + `&shipping_tracking_number=in.(${encodedList})`;
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: 'get',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+    },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error(`Supabase API error: ${code} ${res.getContentText()}`);
+  }
+
+  const text = res.getContentText();
+  if (!text) return [];
+  try {
+    const data = JSON.parse(text);
+    return Array.isArray(data) ? data : [];
+  } catch (e) {
+    return [];
+  }
 }
 
 
@@ -245,8 +355,8 @@ function createChatworkTask_(roomId, body, toIds, limitTs) {
 
 // ====== 設定シート ======
 function getAssigneeIdByRole_(role) {
-  if (!SETTINGS_SPREADSHEET_ID) return '';
-  const ss = SpreadsheetApp.openById(SETTINGS_SPREADSHEET_ID);
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return '';
   const sheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
   if (!sheet) return '';
 
