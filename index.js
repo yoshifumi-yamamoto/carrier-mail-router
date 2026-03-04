@@ -9,6 +9,7 @@
 // ====== ここだけ設定 ======
 const CHATWORK_API_TOKEN = 'a5dea6686afa054aa28913cad677122c';
 const CHATWORK_ROOM_ID = '421984269';
+const TRACKING_ROOM_ID = '345267509';
 
 const BASE_QUERY = [
   '(from:(@dhl.com OR @dhl.de OR @dhl.co.jp OR @dpdhl.com) OR from:(@fedex.com OR @fedex.co.jp))',
@@ -28,7 +29,7 @@ const MAX_COLLECT_PER_RUN = 30;
 
 // スプレッドシート設定
 // このスクリプトがスプレッドシートに紐づいている前提
-const SETTINGS_SHEET_NAME = '設定';
+const SETTINGS_SHEET_NAME = '担当者';
 const ROLE_INVOICE_CONFIRMED = '請求確定';
 
 // Supabase（ScriptProperties に設定）
@@ -42,11 +43,16 @@ function notifyCarrierEmailsToChatwork() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(25000)) return;
 
+  const runId = new Date().toISOString();
+  console.log(`[run ${runId}] start`);
+
   try {
     const props = PropertiesService.getScriptProperties();
     const notified = loadNotifiedMap_(props); // { [messageId]: timestampNumber }
+    console.log(`[run ${runId}] notified loaded: ${Object.keys(notified).length}`);
 
     const threads = GmailApp.search(BASE_QUERY, 0, 30);
+    console.log(`[run ${runId}] threads: ${threads.length}`);
     if (!threads.length) return;
 
     const items = [];
@@ -60,13 +66,25 @@ function notifyCarrierEmailsToChatwork() {
         const msg = messages[i];
         const msgId = msg.getId();
 
-        if (notified[msgId]) continue;
+        if (notified[msgId]) {
+          console.log(`[run ${runId}] skip notified msgId=${msgId}`);
+          continue;
+        }
 
         const from = msg.getFrom() || '';
         const subject = msg.getSubject() || '';
         const date = msg.getDate();
 
         if (isOlderThanDays_(date, 14)) continue;
+        if (
+          subject.includes('DHL集荷確認のお知らせ') ||
+          subject.includes('DHL集荷予約の確認') ||
+          subject.includes('梱包資材のご注文について') ||
+          subject.includes('注文の進捗')
+        ) {
+          console.log(`[run ${runId}] skip pickup-confirmation subject msgId=${msgId}`);
+          continue;
+        }
 
         let bodyText = '';
         try {
@@ -74,11 +92,14 @@ function notifyCarrierEmailsToChatwork() {
         } catch (e) {
           bodyText = '';
         }
-        const snippet = bodyText.replace(/\s+/g, ' ').trim().slice(0, SNIPPET_MAX);
+        let fullBody = bodyText.replace(/\r\n/g, '\n').trim();
         const link = `https://mail.google.com/mail/u/0/#all/${msgId}`;
 
         const cls = classifyCarrierEmail_(from, subject);
-        const trackingNumbers = extractTrackingNumbers_(subject, bodyText);
+        if (cls.carrier === 'DHL') {
+          fullBody = trimDhlFooter_(fullBody);
+        }
+        const trackingNumbers = extractTrackingNumbers_(subject, bodyText, cls.carrier);
 
         items.push({
           msgId,
@@ -88,7 +109,7 @@ function notifyCarrierEmailsToChatwork() {
           from,
           subject,
           date,
-          snippet,
+          fullBody,
           link,
           trackingNumbers,
         });
@@ -101,37 +122,61 @@ function notifyCarrierEmailsToChatwork() {
     }
 
     if (!items.length) return;
+    console.log(`[run ${runId}] items collected: ${items.length}`);
+    console.log(`[run ${runId}] item msgIds: ${items.map(it => it.msgId).join(',')}`);
 
-    // 追跡番号から対象アカウントを引く
-    const trackingToUsers = fetchEbayUserIdsByTrackingNumbers_(items);
+    // 追跡番号から対象アカウントを引く（失敗しても通知は継続）
+    let lookup = { usersByTracking: {}, ordersByTracking: {}, lookupFailed: false };
+    try {
+      lookup = fetchEbayUserIdsByTrackingNumbers_(items);
+    } catch (e) {
+      console.error('Supabase lookup failed:', e && e.message ? e.message : e);
+      lookup = { usersByTracking: {}, ordersByTracking: {}, lookupFailed: true };
+    }
+    console.log(`[run ${runId}] trackingToUsers keys: ${Object.keys(lookup.usersByTracking).length}`);
+    console.log(`[run ${runId}] trackingToOrders keys: ${Object.keys(lookup.ordersByTracking).length}`);
 
     // 1通にまとめる（429対策）
-    const header = `[info][title]📦 キャリアメール新着 ${items.length}件（DHL/FedEx）[/title]`;
-    const blocks = items.map((it, idx) => {
-      const tns = it.trackingNumbers || [];
-      const users = tns.flatMap(tn => trackingToUsers[tn] || []);
-      const uniqueUsers = Array.from(new Set(users)).filter(Boolean);
+    const trackingItems = items.filter(it => (it.trackingNumbers || []).length > 0);
+    const otherItems = items.filter(it => (it.trackingNumbers || []).length === 0);
 
-      return [
-        `#${idx + 1} ${it.title}｜${it.carrier}`,
-        `■ Subject: ${escapeForChatwork_(it.subject)}`,
-        `■ From: ${escapeForChatwork_(it.from)}`,
-        `■ Date: ${it.date}`,
-        `■ Category: ${it.bucket}`,
-        tns.length ? `■ Tracking: ${tns.join(', ')}` : '',
-        uniqueUsers.length ? `■ 対象アカウント: ${uniqueUsers.join(', ')}` : '',
-        it.snippet ? `■ Snippet: ${escapeForChatwork_(it.snippet)}` : '',
-        `■ Gmail: ${it.link}`,
-      ].filter(Boolean).join('\n');
-    });
+    if (trackingItems.length) {
+      const body = buildChatworkBody_(trackingItems, lookup, '追跡番号付き');
+      console.log(`[run ${runId}] posting to chatwork (room=${TRACKING_ROOM_ID})`);
+      postToChatworkWithRetry_(TRACKING_ROOM_ID, body);
+      console.log(`[run ${runId}] chatwork post ok (tracking room)`);
+    }
 
-    const body = [header, blocks.join('\n\n' + '―'.repeat(10) + '\n\n'), '[/info]'].join('\n\n');
+    if (otherItems.length) {
+      const body = buildChatworkBody_(otherItems, lookup, 'その他');
+      console.log(`[run ${runId}] posting to chatwork (room=${CHATWORK_ROOM_ID})`);
+      postToChatworkWithRetry_(CHATWORK_ROOM_ID, body);
+      console.log(`[run ${runId}] chatwork post ok (default room)`);
+    }
 
-    // ★送信（429ならバックオフ）
-    postToChatworkWithRetry_(CHATWORK_ROOM_ID, body);
+    // ★請求確定はタスク化（失敗しても通知済みは保存）
+    try {
+      const created = createTasksForInvoiceConfirmed_(items);
+      if (created) {
+        console.log(`[run ${runId}] task creation ok`);
+      } else {
+        console.warn(`[run ${runId}] task creation skipped`);
+      }
+    } catch (e) {
+      console.error('Chatwork task creation failed:', e && e.message ? e.message : e);
+    }
 
-    // ★請求確定はタスク化
-    createTasksForInvoiceConfirmed_(items);
+    // ★eBayアカウントIDの担当者にタスク作成
+    try {
+      const created = createTasksForEbayUsers_(items, lookup.usersByTracking);
+      if (created) {
+        console.log(`[run ${runId}] user task creation ok`);
+      } else {
+        console.warn(`[run ${runId}] user task creation skipped`);
+      }
+    } catch (e) {
+      console.error('Chatwork user task creation failed:', e && e.message ? e.message : e);
+    }
 
     // ★送信成功後に通知済み確定
     const now = Date.now();
@@ -139,10 +184,18 @@ function notifyCarrierEmailsToChatwork() {
       notified[it.msgId] = now;
     }
     trimNotifiedMap_(notified, NOTIFIED_MAX_KEYS);
-    props.setProperty(NOTIFIED_KEY, JSON.stringify(notified));
+    const serialized = JSON.stringify(notified);
+    console.log(`[run ${runId}] saving notified: ${Object.keys(notified).length}, bytes=${serialized.length}`);
+    try {
+      props.setProperty(NOTIFIED_KEY, serialized);
+      console.log(`[run ${runId}] notified saved ok`);
+    } catch (e) {
+      console.error(`[run ${runId}] notified save failed:`, e && e.message ? e.message : e);
+    }
 
   } finally {
     lock.releaseLock();
+    console.log(`[run ${runId}] end`);
   }
 }
 
@@ -195,17 +248,28 @@ function classifyCarrierEmail_(from, subject) {
 }
 
 // ====== 追跡番号抽出 ======
-function extractTrackingNumbers_(subject, bodyText) {
-  const text = [subject || '', bodyText || ''].join(' ');
+function extractTrackingNumbers_(subject, bodyText, carrier) {
+  const rawText = [subject || '', bodyText || ''].join('\n');
+  // URL 内の数値は請求リンク等の誤検知になりやすいため除外
+  const text = rawText.replace(/https?:\/\/\S+/gi, ' ');
   const results = [];
 
-  // FedEx: 12〜15桁（代表: 12/15桁）
-  const fedex = text.match(/\b\d{12,15}\b/g);
-  if (fedex) results.push(...fedex);
+  if (carrier === 'FedEx') {
+    // FedEx: 12〜15桁（代表: 12/15桁）
+    const fedex = text.match(/\b\d{12,15}\b/g);
+    if (fedex) results.push(...fedex);
+  }
 
-  // DHL: 10桁
-  const dhl = text.match(/\b\d{10}\b/g);
-  if (dhl) results.push(...dhl);
+  if (carrier === 'DHL') {
+    // DHL 10桁は追跡系キーワードがある行のみ抽出（請求番号/口座番号の誤検知を抑制）
+    const lines = text.split('\n');
+    const dhlHint = /(tracking|track|awb|waybill|shipment|運送状|送り状|追跡|tracking number)/i;
+    for (const line of lines) {
+      if (!dhlHint.test(line)) continue;
+      const matched = line.match(/\b\d{10}\b/g);
+      if (matched) results.push(...matched);
+    }
+  }
 
   // 重複排除
   return Array.from(new Set(results));
@@ -214,7 +278,7 @@ function extractTrackingNumbers_(subject, bodyText) {
 // ====== Supabase 連携 ======
 function fetchEbayUserIdsByTrackingNumbers_(items) {
   const cfg = getSupabaseConfig_();
-  if (!cfg) return {};
+  if (!cfg) return { usersByTracking: {}, ordersByTracking: {}, lookupFailed: true };
 
   const all = [];
   for (const it of items) {
@@ -223,9 +287,10 @@ function fetchEbayUserIdsByTrackingNumbers_(items) {
     }
   }
   const uniqueTracking = Array.from(new Set(all));
-  if (!uniqueTracking.length) return {};
+  if (!uniqueTracking.length) return { usersByTracking: {}, ordersByTracking: {}, lookupFailed: false };
 
-  const map = {};
+  const usersByTracking = {};
+  const ordersByTracking = {};
   const batchSize = 100;
   for (let i = 0; i < uniqueTracking.length; i += batchSize) {
     const batch = uniqueTracking.slice(i, i + batchSize);
@@ -233,12 +298,18 @@ function fetchEbayUserIdsByTrackingNumbers_(items) {
     for (const row of rows) {
       const tn = String(row.shipping_tracking_number || '').trim();
       const user = String(row.ebay_user_id || '').trim();
-      if (!tn || !user) continue;
-      if (!map[tn]) map[tn] = [];
-      map[tn].push(user);
+      const orderNo = String(row.order_no || '').trim();
+      if (tn && user) {
+        if (!usersByTracking[tn]) usersByTracking[tn] = [];
+        usersByTracking[tn].push(user);
+      }
+      if (tn && orderNo) {
+        if (!ordersByTracking[tn]) ordersByTracking[tn] = [];
+        ordersByTracking[tn].push(orderNo);
+      }
     }
   }
-  return map;
+  return { usersByTracking, ordersByTracking, lookupFailed: false };
 }
 
 function getSupabaseConfig_() {
@@ -250,16 +321,16 @@ function getSupabaseConfig_() {
 }
 
 function querySupabaseOrdersByTracking_(cfg, trackingNumbers) {
-  const encodedList = trackingNumbers
+  const list = trackingNumbers
     .map(t => String(t).trim())
     .filter(Boolean)
-    .map(t => `"${t.replace(/"/g, '\\"')}"`)
     .join(',');
-  if (!encodedList) return [];
+  if (!list) return [];
 
+  const filter = `in.(${list})`;
   const endpoint = `${cfg.url}/rest/v1/${SUPABASE_ORDERS_TABLE}`
-    + `?select=shipping_tracking_number,ebay_user_id`
-    + `&shipping_tracking_number=in.(${encodedList})`;
+    + `?select=shipping_tracking_number,ebay_user_id,order_no`
+    + `&shipping_tracking_number=${encodeURIComponent(filter)}`;
 
   const res = UrlFetchApp.fetch(endpoint, {
     method: 'get',
@@ -321,10 +392,11 @@ function postToChatworkRaw_(roomId, message) {
 // ====== Chatworkタスク作成 ======
 function createTasksForInvoiceConfirmed_(items) {
   const targetItems = items.filter(it => it.bucket === 'invoice_confirmed');
-  if (!targetItems.length) return;
+  if (!targetItems.length) return false;
 
   const assignee = getAssigneeIdByRole_(ROLE_INVOICE_CONFIRMED);
-  if (!assignee) return;
+  console.log(`[task] assignee role=${ROLE_INVOICE_CONFIRMED} id=${assignee}`);
+  if (!assignee) return false;
 
   const limitTs = Math.floor((Date.now() + 3 * 24 * 60 * 60 * 1000) / 1000);
 
@@ -335,8 +407,10 @@ function createTasksForInvoiceConfirmed_(items) {
       `From: ${it.from}`,
       `Gmail: ${it.link}`,
     ].join('\n');
-    createChatworkTask_(CHATWORK_ROOM_ID, taskBody, assignee, limitTs);
+    const res = createChatworkTask_(CHATWORK_ROOM_ID, taskBody, assignee, limitTs);
+    console.log(`[task] create response code=${res.getResponseCode()} body=${res.getContentText()}`);
   }
+  return true;
 }
 
 function createChatworkTask_(roomId, body, toIds, limitTs) {
@@ -351,6 +425,38 @@ function createChatworkTask_(roomId, body, toIds, limitTs) {
     },
     muteHttpExceptions: true,
   });
+}
+
+function createTasksForEbayUsers_(items, usersByTracking) {
+  if (!items || !items.length) return false;
+  const limitTs = Math.floor((Date.now() + 3 * 24 * 60 * 60 * 1000) / 1000);
+  let createdAny = false;
+
+  for (const it of items) {
+    const tns = it.trackingNumbers || [];
+    const users = tns.flatMap(tn => usersByTracking[tn] || []);
+    const uniqueUsers = Array.from(new Set(users)).filter(Boolean);
+    if (!uniqueUsers.length) continue;
+
+    for (const userId of uniqueUsers) {
+      const assignee = getAssigneeIdByRole_(userId);
+      console.log(`[user-task] ebay_user_id=${userId} assignee=${assignee}`);
+      if (!assignee) continue;
+
+      const taskBody = [
+        `【キャリアメール】${it.carrier}`,
+        `eBay: ${userId}`,
+        `Subject: ${it.subject}`,
+        `From: ${it.from}`,
+        `Gmail: ${it.link}`,
+      ].join('\n');
+      const res = createChatworkTask_(CHATWORK_ROOM_ID, taskBody, assignee, limitTs);
+      console.log(`[user-task] create response code=${res.getResponseCode()} body=${res.getContentText()}`);
+      createdAny = true;
+    }
+  }
+
+  return createdAny;
 }
 
 // ====== 設定シート ======
@@ -401,6 +507,49 @@ function isOlderThanDays_(dateObj, days) {
 // ====== 表示崩れ防止 ======
 function escapeForChatwork_(text) {
   return String(text).replace(/\[|\]/g, (m) => (m === '[' ? '［' : '］'));
+}
+
+function buildChatworkBody_(items, lookup, label) {
+  const header = `[info][title]📦 キャリアメール新着 ${items.length}件（DHL/FedEx）｜${label}[/title]`;
+  const blocks = items.map((it, idx) => {
+    const tns = it.trackingNumbers || [];
+    const users = tns.flatMap(tn => lookup.usersByTracking[tn] || []);
+    const orders = tns.flatMap(tn => lookup.ordersByTracking[tn] || []);
+    const uniqueUsers = Array.from(new Set(users)).filter(Boolean);
+    const uniqueOrders = Array.from(new Set(orders)).filter(Boolean);
+
+    return [
+      `#${idx + 1} ${it.title}｜${it.carrier}`,
+      `■ Subject: ${escapeForChatwork_(it.subject)}`,
+      `■ From: ${escapeForChatwork_(it.from)}`,
+      `■ Date: ${it.date}`,
+      `■ Category: ${it.bucket}`,
+      tns.length ? `■ Tracking: ${tns.join(', ')}` : '',
+      uniqueUsers.length ? `■ 対象アカウント: ${uniqueUsers.join(', ')}` : '',
+      (tns.length && !uniqueUsers.length)
+        ? (lookup.lookupFailed
+            ? '■ 対象アカウント: 検索失敗（Supabase連携エラー）'
+            : '■ 対象アカウント: 見つかりませんでした')
+        : '',
+      uniqueOrders.length ? `■ Order: ${uniqueOrders.join(', ')}` : '',
+      it.fullBody ? `■ Body: ${escapeForChatwork_(it.fullBody)}` : '',
+      `■ Gmail: ${it.link}`,
+    ].filter(Boolean).join('\n');
+  });
+
+  return [header, blocks.join('\n\n' + '―'.repeat(10) + '\n\n'), '[/info]'].join('\n\n');
+}
+
+function trimDhlFooter_(text) {
+  if (!text) return '';
+  const marker = /DHL\s*Express\s*[–-]\s*Excellence\.\s*Simply\s*delivered\./i;
+  const lines = String(text).split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (marker.test(lines[i])) {
+      return lines.slice(0, i).join('\n').trim();
+    }
+  }
+  return text;
 }
 
 
