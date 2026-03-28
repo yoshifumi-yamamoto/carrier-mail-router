@@ -19,3 +19,14 @@ A列に役割、B列に担当者IDを設定します。
 ## メモ
 - `index.js` の `SETTINGS_SPREADSHEET_ID` を設定してください。
 - Chatwork の API トークンとルームIDも `index.js` に設定します。
+- Script Properties に以下を設定してください。
+  - `SUPABASE_URL`
+  - `SUPABASE_SERVICE_ROLE_KEY`
+  - `CARRIER_INVOICE_API_URL`
+  - `CARRIER_INVOICE_API_SECRET`
+
+## Carrier invoice 連携
+請求確定メールを検知すると、GAS から backend の `POST /api/csv/carrier-invoice-email` に通知し、
+`carrier_invoices` に `pending` ステータスで請求書ヘッダを登録します。
+
+CSV を `upload-carrier-invoices` で取り込むと、同じ `(carrier, invoice_number)` の行が `imported` に更新されます。

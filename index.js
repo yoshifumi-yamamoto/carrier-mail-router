@@ -8,7 +8,7 @@
 
 // ====== ここだけ設定 ======
 const CHATWORK_API_TOKEN = 'a5dea6686afa054aa28913cad677122c';
-const CHATWORK_ROOM_ID = '421984269';
+const CHATWORK_ROOM_ID = '429289643';
 const TRACKING_ROOM_ID = '345267509';
 
 const BASE_QUERY = [
@@ -36,6 +36,8 @@ const ROLE_INVOICE_CONFIRMED = '請求確定';
 const SUPABASE_URL_PROP = 'SUPABASE_URL';
 const SUPABASE_SERVICE_ROLE_KEY_PROP = 'SUPABASE_SERVICE_ROLE_KEY';
 const SUPABASE_ORDERS_TABLE = 'orders';
+const CARRIER_INVOICE_API_URL_PROP = 'CARRIER_INVOICE_API_URL';
+const CARRIER_INVOICE_API_SECRET_PROP = 'CARRIER_INVOICE_API_SECRET';
 
 
 // ====== メイン ======
@@ -164,6 +166,13 @@ function notifyCarrierEmailsToChatwork() {
       }
     } catch (e) {
       console.error('Chatwork task creation failed:', e && e.message ? e.message : e);
+    }
+
+    try {
+      const synced = syncCarrierInvoicesToBackend_(items);
+      console.log(`[run ${runId}] carrier invoice sync count=${synced}`);
+    } catch (e) {
+      console.error('Carrier invoice sync failed:', e && e.message ? e.message : e);
     }
 
     // ★eBayアカウントIDの担当者にタスク作成
@@ -411,6 +420,165 @@ function createTasksForInvoiceConfirmed_(items) {
     console.log(`[task] create response code=${res.getResponseCode()} body=${res.getContentText()}`);
   }
   return true;
+}
+
+function syncCarrierInvoicesToBackend_(items) {
+  const cfg = getCarrierInvoiceApiConfig_();
+  if (!cfg) return 0;
+
+  const targetItems = items.filter(it => it.bucket === 'invoice_confirmed');
+  let synced = 0;
+
+  for (const it of targetItems) {
+    const invoice = extractCarrierInvoiceDetails_(it);
+    if (!invoice || !invoice.invoice_number) {
+      console.warn(`[carrier-invoice] skip sync because invoice number is missing msgId=${it.msgId}`);
+      continue;
+    }
+    postCarrierInvoiceToBackend_(cfg, {
+      carrier: invoice.carrier,
+      invoice_number: invoice.invoice_number,
+      invoice_date: invoice.invoice_date,
+      due_date: invoice.due_date,
+      invoice_total_amount: invoice.invoice_total_amount,
+      currency: invoice.currency,
+      billing_account: invoice.billing_account,
+      source_message_id: it.msgId,
+      status: 'pending',
+      raw_payload: {
+        from: it.from,
+        subject: it.subject,
+        date: it.date ? new Date(it.date).toISOString() : null,
+        body: it.fullBody,
+        gmail_link: it.link,
+      },
+    });
+    synced += 1;
+  }
+
+  return synced;
+}
+
+function getCarrierInvoiceApiConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const url = (props.getProperty(CARRIER_INVOICE_API_URL_PROP) || '').trim();
+  const secret = (props.getProperty(CARRIER_INVOICE_API_SECRET_PROP) || '').trim();
+  if (!url || !secret) return null;
+  return { url, secret };
+}
+
+function postCarrierInvoiceToBackend_(cfg, payload) {
+  const res = UrlFetchApp.fetch(cfg.url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'x-carrier-router-secret': cfg.secret,
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error(`Carrier invoice API error: ${code} ${res.getContentText()}`);
+  }
+  return res;
+}
+
+function extractCarrierInvoiceDetails_(item) {
+  const carrier = normalizeCarrierLabel_(item.carrier);
+  const subject = item.subject || '';
+  const body = item.fullBody || '';
+  const text = [subject, body].join('\n');
+
+  if (carrier === 'FEDEX') {
+    return {
+      carrier,
+      invoice_number: firstMatch_(text, /\b\d{9}\b/),
+      invoice_date: normalizeInvoiceDateText_(firstMatch_(text, /\b\d{1,2}-[A-Za-z]{3}-\d{4}\b/)),
+      due_date: normalizeInvoiceDateText_(extractFedexDueDate_(text)),
+      invoice_total_amount: normalizeMoneyText_(firstMatch_(text, /\b\d+(?:,\d{3})*(?:\.\d{2})\s*JPY\b/i)),
+      currency: extractCurrency_(text) || 'JPY',
+      billing_account: null,
+    };
+  }
+
+  if (carrier === 'DHL') {
+    return {
+      carrier,
+      invoice_number: firstMatch_(text, /\b[A-Z]{3}[A-Z0-9]+\b/),
+      invoice_date: normalizeInvoiceDateText_(extractDhlInvoiceDate_(text)),
+      due_date: null,
+      invoice_total_amount: normalizeMoneyText_(firstMatch_(text, /[¥￥]\s*\d+(?:,\d{3})*(?:\.\d{2})?/)),
+      currency: extractCurrency_(text) || 'JPY',
+      billing_account: firstMatch_(text, /account番号[:：]\s*([0-9]+)/i, 1),
+    };
+  }
+
+  return null;
+}
+
+function normalizeCarrierLabel_(carrier) {
+  const upper = String(carrier || '').trim().toUpperCase();
+  if (upper === 'FEDEX' || upper === 'FED EX') return 'FEDEX';
+  if (upper === 'DHL') return 'DHL';
+  return upper;
+}
+
+function extractFedexDueDate_(text) {
+  const matches = String(text || '').match(/\b\d{1,2}-[A-Za-z]{3}-\d{4}\b/g);
+  if (!matches || !matches.length) return '';
+  return matches[matches.length - 1];
+}
+
+function extractDhlInvoiceDate_(text) {
+  return firstMatch_(text, /\d{4}年\d{1,2}月\d{1,2}日/);
+}
+
+function firstMatch_(text, regex, groupIndex) {
+  const match = String(text || '').match(regex);
+  if (!match) return '';
+  return match[groupIndex || 0] || '';
+}
+
+function extractCurrency_(text) {
+  const upper = String(text || '').toUpperCase();
+  if (upper.indexOf('JPY') !== -1 || upper.indexOf('¥') !== -1 || upper.indexOf('￥') !== -1) return 'JPY';
+  if (upper.indexOf('USD') !== -1 || upper.indexOf('$') !== -1) return 'USD';
+  if (upper.indexOf('EUR') !== -1 || upper.indexOf('€') !== -1) return 'EUR';
+  return '';
+}
+
+function normalizeMoneyText_(text) {
+  const raw = String(text || '');
+  const matched = raw.match(/-?\d+(?:,\d{3})*(?:\.\d{2})?/);
+  return matched ? matched[0].replace(/,/g, '') : null;
+}
+
+function normalizeInvoiceDateText_(text) {
+  const value = String(text || '').trim();
+  if (!value) return null;
+
+  let match = value.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if (match) {
+    const months = {
+      jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+      jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+    };
+    const month = months[String(match[2]).toLowerCase()];
+    if (!month) return null;
+    return `${match[3]}-${month}-${String(match[1]).padStart(2, '0')}`;
+  }
+
+  match = value.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日$/);
+  if (match) {
+    return `${match[1]}-${String(match[2]).padStart(2, '0')}-${String(match[3]).padStart(2, '0')}`;
+  }
+
+  match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (match) return value;
+
+  return null;
 }
 
 function createChatworkTask_(roomId, body, toIds, limitTs) {
